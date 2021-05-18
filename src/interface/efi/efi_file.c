@@ -50,17 +50,39 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 /** EFI media ID */
 #define EFI_MEDIA_ID_MAGIC 0x69505845
 
-/** An image exposed as an EFI file */
+/** An EFI file */
 struct efi_file {
+	/** Reference count */
+	struct refcnt refcnt;
 	/** EFI file protocol */
 	EFI_FILE_PROTOCOL file;
-	/** Image */
+	/** Image (if any) */
 	struct image *image;
+	/** Filename */
+	const char *name;
 	/** Current file position */
 	size_t pos;
+	/** File length */
+	size_t len;
 };
 
 static struct efi_file efi_file_root;
+
+static EFI_STATUS EFIAPI efi_file_read_image ( EFI_FILE_PROTOCOL *this,
+					       UINTN *len, VOID *data );
+
+/**
+ * Free EFI file
+ *
+ * @v refcnt		Reference count
+ */
+static void efi_file_free ( struct refcnt *refcnt ) {
+	struct efi_file *file =
+		container_of ( refcnt, struct efi_file, refcnt );
+
+	image_put ( file->image );
+	free ( file );
+}
 
 /**
  * Get EFI file name (for debugging)
@@ -70,7 +92,7 @@ static struct efi_file efi_file_root;
  */
 static const char * efi_file_name ( struct efi_file *file ) {
 
-	return ( file->image ? file->image->name : "<root>" );
+	return ( file == &efi_file_root ? "<root>" : file->name );
 }
 
 /**
@@ -91,7 +113,6 @@ static struct image * efi_file_find ( const CHAR16 *wname ) {
 	}
 
 	return NULL;
-
 }
 
 /**
@@ -106,8 +127,7 @@ static struct image * efi_file_find ( const CHAR16 *wname ) {
  */
 static EFI_STATUS EFIAPI
 efi_file_open ( EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new,
-		CHAR16 *wname, UINT64 mode __unused,
-		UINT64 attributes __unused ) {
+		CHAR16 *wname, UINT64 mode, UINT64 attributes __unused ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
 	struct efi_file *new_file;
 	struct image *image;
@@ -121,11 +141,12 @@ efi_file_open ( EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new,
 	/* Allow root directory itself to be opened */
 	if ( ( wname[0] == L'\0' ) || ( wname[0] == L'.' ) ) {
 		*new = &efi_file_root.file;
+		ref_get ( &efi_file_root.refcnt );
 		return 0;
 	}
 
 	/* Fail unless opening from the root */
-	if ( file->image ) {
+	if ( file != &efi_file_root ) {
 		DBGC ( file, "EFIFILE %s is not a directory\n",
 		       efi_file_name ( file ) );
 		return EFI_NOT_FOUND;
@@ -147,9 +168,15 @@ efi_file_open ( EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new,
 
 	/* Allocate and initialise file */
 	new_file = zalloc ( sizeof ( *new_file ) );
+	if ( ! new_file )
+		return EFI_OUT_OF_RESOURCES;
+	ref_init ( &file->refcnt, efi_file_free );
 	memcpy ( &new_file->file, &efi_file_root.file,
 		 sizeof ( new_file->file ) );
+	new_file->file.Read = efi_file_read_image;
 	new_file->image = image_get ( image );
+	new_file->name = image->name;
+	new_file->len = image->len;
 	*new = &new_file->file;
 	DBGC ( new_file, "EFIFILE %s opened\n", efi_file_name ( new_file ) );
 
@@ -165,14 +192,9 @@ efi_file_open ( EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new,
 static EFI_STATUS EFIAPI efi_file_close ( EFI_FILE_PROTOCOL *this ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
 
-	/* Do nothing if this is the root */
-	if ( ! file->image )
-		return 0;
-
 	/* Close file */
 	DBGC ( file, "EFIFILE %s closed\n", efi_file_name ( file ) );
-	image_put ( file->image );
-	free ( file );
+	ref_put ( &file->refcnt );
 
 	return 0;
 }
@@ -229,51 +251,50 @@ static EFI_STATUS efi_file_varlen ( UINT64 *base, size_t base_len,
 /**
  * Return file information structure
  *
- * @v image		Image, or NULL for the root directory
+ * @v file		EFI file
  * @v len		Length of data buffer
  * @v data		Data buffer
  * @ret efirc		EFI status code
  */
-static EFI_STATUS efi_file_info ( struct image *image, UINTN *len,
+static EFI_STATUS efi_file_info ( struct efi_file *file, UINTN *len,
 				  VOID *data ) {
 	EFI_FILE_INFO info;
-	const char *name;
 
 	/* Populate file information */
 	memset ( &info, 0, sizeof ( info ) );
-	if ( image ) {
-		info.FileSize = image->len;
-		info.PhysicalSize = image->len;
-		info.Attribute = EFI_FILE_READ_ONLY;
-		name = image->name;
-	} else {
-		info.Attribute = ( EFI_FILE_READ_ONLY | EFI_FILE_DIRECTORY );
-		name = "";
-	}
+	info.FileSize = file->len;
+	info.PhysicalSize = file->len;
+	info.Attribute = EFI_FILE_READ_ONLY;
+	if ( file == &efi_file_root )
+		info.Attribute |= EFI_FILE_DIRECTORY;
 
-	return efi_file_varlen ( &info.Size, SIZE_OF_EFI_FILE_INFO, name,
-				 len, data );
+	return efi_file_varlen ( &info.Size, SIZE_OF_EFI_FILE_INFO,
+				 file->name, len, data );
 }
 
 /**
- * Read directory entry
+ * Read root directory entry
  *
- * @v file		EFI file
+ * @v this		EFI file
  * @v len		Length to read
  * @v data		Data buffer
  * @ret efirc		EFI status code
  */
-static EFI_STATUS efi_file_read_dir ( struct efi_file *file, UINTN *len,
-				      VOID *data ) {
-	EFI_STATUS efirc;
+static EFI_STATUS EFIAPI efi_file_read_root ( EFI_FILE_PROTOCOL *this,
+					      UINTN *len, VOID *data ) {
+	struct efi_file *file = container_of ( this, struct efi_file, file );
+	struct efi_file entry;
 	struct image *image;
 	unsigned int index;
+	EFI_STATUS efirc;
 
 	/* Construct directory entry at current position */
 	index = file->pos;
 	for_each_image ( image ) {
 		if ( index-- == 0 ) {
-			efirc = efi_file_info ( image, len, data );
+			entry.name = image->name;
+			entry.len = image->len;
+			efirc = efi_file_info ( &entry, len, data );
 			if ( efirc == 0 )
 				file->pos++;
 			return efirc;
@@ -286,24 +307,20 @@ static EFI_STATUS efi_file_read_dir ( struct efi_file *file, UINTN *len,
 }
 
 /**
- * Read from file
+ * Read from image-backed file
  *
  * @v this		EFI file
  * @v len		Length to read
  * @v data		Data buffer
  * @ret efirc		EFI status code
  */
-static EFI_STATUS EFIAPI efi_file_read ( EFI_FILE_PROTOCOL *this,
-					 UINTN *len, VOID *data ) {
+static EFI_STATUS EFIAPI efi_file_read_image ( EFI_FILE_PROTOCOL *this,
+					       UINTN *len, VOID *data ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
 	size_t remaining;
 
-	/* If this is the root directory, then construct a directory entry */
-	if ( ! file->image )
-		return efi_file_read_dir ( file, len, data );
-
 	/* Read from the file */
-	remaining = ( file->image->len - file->pos );
+	remaining = ( file->len - file->pos );
 	if ( *len > remaining )
 		*len = remaining;
 	DBGC ( file, "EFIFILE %s read [%#08zx,%#08zx)\n",
@@ -343,23 +360,16 @@ static EFI_STATUS EFIAPI efi_file_set_position ( EFI_FILE_PROTOCOL *this,
 						 UINT64 position ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
 
-	/* If this is the root directory, reset to the start */
-	if ( ! file->image ) {
-		DBGC ( file, "EFIFILE root directory rewound\n" );
-		file->pos = 0;
-		return 0;
-	}
-
 	/* Check for the magic end-of-file value */
 	if ( position == 0xffffffffffffffffULL )
-		position = file->image->len;
+		position = file->len;
 
 	/* Fail if we attempt to seek past the end of the file (since
 	 * we do not support writes).
 	 */
-	if ( position > file->image->len ) {
+	if ( position > file->len ) {
 		DBGC ( file, "EFIFILE %s cannot seek to %#08llx of %#08zx\n",
-		       efi_file_name ( file ), position, file->image->len );
+		       efi_file_name ( file ), position, file->len );
 		return EFI_UNSUPPORTED;
 	}
 
@@ -408,7 +418,7 @@ static EFI_STATUS EFIAPI efi_file_get_info ( EFI_FILE_PROTOCOL *this,
 		/* Get file information */
 		DBGC ( file, "EFIFILE %s get file information\n",
 		       efi_file_name ( file ) );
-		return efi_file_info ( file->image, len, data );
+		return efi_file_info ( file, len, data );
 
 	} else if ( memcmp ( type, &efi_file_system_info_id,
 			     sizeof ( *type ) ) == 0 ) {
@@ -468,12 +478,13 @@ static EFI_STATUS EFIAPI efi_file_flush ( EFI_FILE_PROTOCOL *this ) {
 
 /** Root directory */
 static struct efi_file efi_file_root = {
+	.refcnt = REF_INIT ( ref_no_free ),
 	.file = {
 		.Revision = EFI_FILE_PROTOCOL_REVISION,
 		.Open = efi_file_open,
 		.Close = efi_file_close,
 		.Delete = efi_file_delete,
-		.Read = efi_file_read,
+		.Read = efi_file_read_root,
 		.Write = efi_file_write,
 		.GetPosition = efi_file_get_position,
 		.SetPosition = efi_file_set_position,
@@ -482,6 +493,7 @@ static struct efi_file efi_file_root = {
 		.Flush = efi_file_flush,
 	},
 	.image = NULL,
+	.name = "",
 };
 
 /**
@@ -497,6 +509,7 @@ efi_file_open_volume ( EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *filesystem __unused,
 
 	DBGC ( &efi_file_root, "EFIFILE open volume\n" );
 	*file = &efi_file_root.file;
+	ref_get ( &efi_file_root.refcnt );
 	return 0;
 }
 
