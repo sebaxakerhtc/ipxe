@@ -53,6 +53,9 @@ struct cpio_header {
 /** CPIO header length alignment */
 #define CPIO_ALIGN 4
 
+/** Alignment for CPIO archives within an initrd */
+#define INITRD_ALIGN 4096
+
 extern void cpio_set_field ( char *field, unsigned long value );
 extern size_t cpio_name_len ( struct image *image );
 extern size_t cpio_header ( struct image *image, struct cpio_header *cpio );

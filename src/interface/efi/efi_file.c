@@ -38,6 +38,7 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 #include <errno.h>
 #include <wchar.h>
 #include <ipxe/image.h>
+#include <ipxe/cpio.h>
 #include <ipxe/efi/efi.h>
 #include <ipxe/efi/Protocol/SimpleFileSystem.h>
 #include <ipxe/efi/Protocol/BlockIo.h>
@@ -49,6 +50,18 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 
 /** EFI media ID */
 #define EFI_MEDIA_ID_MAGIC 0x69505845
+
+/** An EFI virtual file reader */
+struct efi_file_reader {
+	/** EFI file */
+	struct efi_file *file;
+	/** Offset within virtual file */
+	size_t offset;
+	/** Output data buffer */
+	void *data;
+	/** Length of output data buffer */
+	size_t len;
+};
 
 /** An EFI file */
 struct efi_file {
@@ -62,14 +75,17 @@ struct efi_file {
 	const char *name;
 	/** Current file position */
 	size_t pos;
-	/** File length */
-	size_t len;
+	/**
+	 * Read from file
+	 *
+	 * @v reader		File reader
+	 * @ret len		Length read
+	 */
+	size_t ( * read ) ( struct efi_file_reader *reader );
 };
 
 static struct efi_file efi_file_root;
-
-static EFI_STATUS EFIAPI efi_file_read_image ( EFI_FILE_PROTOCOL *this,
-					       UINTN *len, VOID *data );
+static struct efi_file efi_file_initrd;
 
 /**
  * Free EFI file
@@ -98,21 +114,155 @@ static const char * efi_file_name ( struct efi_file *file ) {
 /**
  * Find EFI file image
  *
- * @v wname		Filename
+ * @v name		Filename
  * @ret image		Image, or NULL
  */
-static struct image * efi_file_find ( const CHAR16 *wname ) {
-	char name[ wcslen ( wname ) + 1 /* NUL */ ];
+static struct image * efi_file_find ( const char *name ) {
 	struct image *image;
 
 	/* Find image */
-	snprintf ( name, sizeof ( name ), "%ls", wname );
 	list_for_each_entry ( image, &images, list ) {
 		if ( strcasecmp ( image->name, name ) == 0 )
 			return image;
 	}
 
 	return NULL;
+}
+
+/**
+ * Get length of EFI file
+ *
+ * @v file		EFI file
+ * @ret len		Length of file
+ */
+static size_t efi_file_len ( struct efi_file *file ) {
+	struct efi_file_reader reader;
+
+	/* Initialise reader */
+	reader.file = file;
+	reader.offset = 0;
+	reader.data = NULL;
+	reader.len = 0;
+
+	/* Perform dummy read to determine file length */
+	file->read ( &reader );
+
+	return reader.offset;
+}
+
+/**
+ * Read chunk of EFI file
+ *
+ * @v reader		EFI file reader
+ * @v data		Input data, or UNULL to zero-fill
+ * @v len		Length of input data
+ * @ret len		Length of output data
+ */
+static size_t efi_file_read_chunk ( struct efi_file_reader *reader,
+				    userptr_t data, size_t len ) {
+	struct efi_file *file = reader->file;
+	size_t offset;
+
+	/* Calculate offset into input data */
+	offset = ( file->pos - reader->offset );
+
+	/* Consume input data range */
+	reader->offset += len;
+
+	/* Calculate output length */
+	if ( len < offset ) {
+		len -= offset;
+	} else {
+		len = 0;
+	}
+	if ( len > reader->len )
+		len = reader->len;
+
+	/* Copy or zero output data */
+	if ( data ) {
+		copy_from_user ( reader->data, data, offset, len );
+	} else {
+		memset ( reader->data, 0, len );
+	}
+	if ( len ) {
+		DBGC ( file, "EFIFILE %s read [%#08zx,%#08zx) => "
+		       "[%#08zx,%#08zx)\n", efi_file_name ( file ),
+		       ( reader->offset - len ), reader->offset, file->pos,
+		       ( file->pos + len ) );
+	}
+
+	/* Consume output buffer */
+	file->pos += len;
+	reader->data += len;
+	reader->len -= len;
+
+	return len;
+}
+
+/**
+ * Read from image-backed file
+ *
+ * @v reader		EFI file reader
+ * @ret len		Length read
+ */
+static size_t efi_file_read_image ( struct efi_file_reader *reader ) {
+	struct efi_file *file = reader->file;
+	struct image *image = file->image;
+
+	/* Read from file */
+	return efi_file_read_chunk ( reader, image->data, image->len );
+}
+
+/**
+ * Read from magic initrd file
+ *
+ * @v reader		EFI file reader
+ * @ret len		Length read
+ */
+static size_t efi_file_read_initrd ( struct efi_file_reader *reader ) {
+	struct cpio_header cpio;
+	struct image *image;
+	const char *name;
+	size_t pad_len;
+	size_t cpio_len;
+	size_t name_len;
+	size_t len;
+
+	/* Read from file */
+	len = 0;
+	for_each_image ( image ) {
+
+		/* Ignore currently executing image */
+		if ( image == current_image )
+			continue;
+
+		//
+		DBGC ( reader->file, "*** %s\n", image->name );
+
+		/* Pad to alignment boundary */
+		pad_len = ( ( -reader->offset ) & ( INITRD_ALIGN - 1 ) );
+		len += efi_file_read_chunk ( reader, UNULL, pad_len );
+
+		/* Read CPIO header, if applicable */
+		cpio_len = cpio_header ( image, &cpio );
+		if ( cpio_len ) {
+			name = image->name;
+			name_len = strlen ( name );
+			pad_len = ( cpio_len - sizeof ( cpio ) - name_len );
+			len += efi_file_read_chunk ( reader,
+						     virt_to_user ( &cpio ),
+						     sizeof ( cpio ) );
+			len += efi_file_read_chunk ( reader,
+						     virt_to_user ( name ),
+						     name_len );
+			len += efi_file_read_chunk ( reader, UNULL, pad_len );
+		}
+
+		/* Read file data */
+		len += efi_file_read_chunk ( reader, image->data, image->len );
+	}
+
+	return len;
 }
 
 /**
@@ -129,17 +279,23 @@ static EFI_STATUS EFIAPI
 efi_file_open ( EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new,
 		CHAR16 *wname, UINT64 mode, UINT64 attributes __unused ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
+	char buf[ wcslen ( wname ) + 1 /* NUL */ ];
 	struct efi_file *new_file;
 	struct image *image;
+	char *name;
+
+	/* Convert name to ASCII */
+	snprintf ( buf, sizeof ( buf ), "%ls", wname );
+	name = buf;
 
 	/* Initial '\' indicates opening from the root directory */
-	while ( *wname == L'\\' ) {
+	while ( *name == '\\' ) {
 		file = &efi_file_root;
-		wname++;
+		name++;
 	}
 
 	/* Allow root directory itself to be opened */
-	if ( ( wname[0] == L'\0' ) || ( wname[0] == L'.' ) ) {
+	if ( ( name[0] == '\0' ) || ( name[0] == '.' ) ) {
 		*new = &efi_file_root.file;
 		ref_get ( &efi_file_root.refcnt );
 		return 0;
@@ -152,18 +308,25 @@ efi_file_open ( EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new,
 		return EFI_NOT_FOUND;
 	}
 
-	/* Identify image */
-	image = efi_file_find ( wname );
-	if ( ! image ) {
-		DBGC ( file, "EFIFILE \"%ls\" does not exist\n", wname );
-		return EFI_NOT_FOUND;
-	}
-
 	/* Fail unless opening read-only */
 	if ( mode != EFI_FILE_MODE_READ ) {
-		DBGC ( file, "EFIFILE %s cannot be opened in mode %#08llx\n",
-		       image->name, mode );
+		DBGC ( file, "EFIFILE \"%s\" cannot be opened in mode "
+		       "%#08llx\n", name, mode );
 		return EFI_WRITE_PROTECTED;
+	}
+
+	/* Allow magic initrd to be opened */
+	if ( strcasecmp ( name, efi_file_initrd.name ) == 0 ) {
+		*new = &efi_file_initrd.file;
+		ref_get ( &efi_file_initrd.refcnt );
+		return 0;
+	}
+
+	/* Identify image */
+	image = efi_file_find ( name );
+	if ( ! image ) {
+		DBGC ( file, "EFIFILE \"%s\" does not exist\n", name );
+		return EFI_NOT_FOUND;
 	}
 
 	/* Allocate and initialise file */
@@ -173,10 +336,9 @@ efi_file_open ( EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new,
 	ref_init ( &file->refcnt, efi_file_free );
 	memcpy ( &new_file->file, &efi_file_root.file,
 		 sizeof ( new_file->file ) );
-	new_file->file.Read = efi_file_read_image;
 	new_file->image = image_get ( image );
 	new_file->name = image->name;
-	new_file->len = image->len;
+	new_file->read = efi_file_read_image;
 	*new = &new_file->file;
 	DBGC ( new_file, "EFIFILE %s opened\n", efi_file_name ( new_file ) );
 
@@ -259,11 +421,15 @@ static EFI_STATUS efi_file_varlen ( UINT64 *base, size_t base_len,
 static EFI_STATUS efi_file_info ( struct efi_file *file, UINTN *len,
 				  VOID *data ) {
 	EFI_FILE_INFO info;
+	size_t file_len;
+
+	/* Get file length */
+	file_len = efi_file_len ( file );
 
 	/* Populate file information */
 	memset ( &info, 0, sizeof ( info ) );
-	info.FileSize = file->len;
-	info.PhysicalSize = file->len;
+	info.FileSize = file_len;
+	info.PhysicalSize = file_len;
 	info.Attribute = EFI_FILE_READ_ONLY;
 	if ( file == &efi_file_root )
 		info.Attribute |= EFI_FILE_DIRECTORY;
@@ -280,25 +446,30 @@ static EFI_STATUS efi_file_info ( struct efi_file *file, UINTN *len,
  * @v data		Data buffer
  * @ret efirc		EFI status code
  */
-static EFI_STATUS EFIAPI efi_file_read_root ( EFI_FILE_PROTOCOL *this,
-					      UINTN *len, VOID *data ) {
-	struct efi_file *file = container_of ( this, struct efi_file, file );
-	struct efi_file entry;
-	struct image *image;
-	unsigned int index;
+static EFI_STATUS EFIAPI efi_file_read_dir ( struct efi_file *file,
+					     UINTN *len, VOID *data ) {
 	EFI_STATUS efirc;
+	struct efi_file entry;
+	unsigned int index;
 
-	/* Construct directory entry at current position */
+	/* Construct directory entries for image-backed files */
 	index = file->pos;
-	for_each_image ( image ) {
+	for_each_image ( entry.image ) {
 		if ( index-- == 0 ) {
-			entry.name = image->name;
-			entry.len = image->len;
+			entry.name = entry.image->name;
 			efirc = efi_file_info ( &entry, len, data );
 			if ( efirc == 0 )
 				file->pos++;
 			return efirc;
 		}
+	}
+
+	/* Construct directory entry for magic initrd */
+	if ( index-- == 0 ) {
+		efirc = efi_file_info ( &efi_file_initrd, len, data );
+		if ( efirc == 0 )
+			file->pos++;
+		return efirc;
 	}
 
 	/* No more entries */
@@ -307,27 +478,31 @@ static EFI_STATUS EFIAPI efi_file_read_root ( EFI_FILE_PROTOCOL *this,
 }
 
 /**
- * Read from image-backed file
+ * Read from file
  *
  * @v this		EFI file
  * @v len		Length to read
  * @v data		Data buffer
  * @ret efirc		EFI status code
  */
-static EFI_STATUS EFIAPI efi_file_read_image ( EFI_FILE_PROTOCOL *this,
-					       UINTN *len, VOID *data ) {
+static EFI_STATUS EFIAPI efi_file_read ( EFI_FILE_PROTOCOL *this,
+					 UINTN *len, VOID *data ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
-	size_t remaining;
+	struct efi_file_reader reader;
 
-	/* Read from the file */
-	remaining = ( file->len - file->pos );
-	if ( *len > remaining )
-		*len = remaining;
-	DBGC ( file, "EFIFILE %s read [%#08zx,%#08zx)\n",
-	       efi_file_name ( file ), file->pos,
-	       ( ( size_t ) ( file->pos + *len ) ) );
-	copy_from_user ( data, file->image->data, file->pos, *len );
-	file->pos += *len;
+	/* If this is the root directory, then construct a directory entry */
+	if ( ! file->read )
+		return efi_file_read_dir ( file, len, data );
+
+	/* Initialise reader */
+	reader.file = file;
+	reader.offset = 0;
+	reader.data = data;
+	reader.len = *len;
+
+	/* Read from file */
+	*len = file->read ( &reader );
+
 	return 0;
 }
 
@@ -359,17 +534,21 @@ static EFI_STATUS EFIAPI efi_file_write ( EFI_FILE_PROTOCOL *this,
 static EFI_STATUS EFIAPI efi_file_set_position ( EFI_FILE_PROTOCOL *this,
 						 UINT64 position ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
+	size_t len;
+
+	/* Get file length */
+	len = efi_file_len ( file );
 
 	/* Check for the magic end-of-file value */
 	if ( position == 0xffffffffffffffffULL )
-		position = file->len;
+		position = len;
 
 	/* Fail if we attempt to seek past the end of the file (since
 	 * we do not support writes).
 	 */
-	if ( position > file->len ) {
+	if ( position > len ) {
 		DBGC ( file, "EFIFILE %s cannot seek to %#08llx of %#08zx\n",
-		       efi_file_name ( file ), position, file->len );
+		       efi_file_name ( file ), position, len );
 		return EFI_UNSUPPORTED;
 	}
 
@@ -484,7 +663,7 @@ static struct efi_file efi_file_root = {
 		.Open = efi_file_open,
 		.Close = efi_file_close,
 		.Delete = efi_file_delete,
-		.Read = efi_file_read_root,
+		.Read = efi_file_read,
 		.Write = efi_file_write,
 		.GetPosition = efi_file_get_position,
 		.SetPosition = efi_file_set_position,
@@ -494,6 +673,27 @@ static struct efi_file efi_file_root = {
 	},
 	.image = NULL,
 	.name = "",
+};
+
+/** Magic initrd file */
+static struct efi_file efi_file_initrd = {
+	.refcnt = REF_INIT ( ref_no_free ),
+	.file = {
+		.Revision = EFI_FILE_PROTOCOL_REVISION,
+		.Open = efi_file_open,
+		.Close = efi_file_close,
+		.Delete = efi_file_delete,
+		.Read = efi_file_read,
+		.Write = efi_file_write,
+		.GetPosition = efi_file_get_position,
+		.SetPosition = efi_file_set_position,
+		.GetInfo = efi_file_get_info,
+		.SetInfo = efi_file_set_info,
+		.Flush = efi_file_flush,
+	},
+	.image = NULL,
+	.name = "initrd.magic",
+	.read = efi_file_read_initrd,
 };
 
 /**
