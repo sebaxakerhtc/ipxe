@@ -125,8 +125,8 @@ size_t cpio_header ( struct image *image, struct cpio_header *cpio ) {
 	cpio_parse_cmdline ( image, cpio );
 
 	/* Calculate total length */
-	len = ( ( sizeof ( cpio ) + name_len + 1 /* NUL */ + CPIO_ALIGN - 1 ) &
-		~( CPIO_ALIGN - 1 ) );
+	len = ( ( sizeof ( *cpio ) + name_len + 1 /* NUL */ + CPIO_ALIGN - 1 )
+		& ~( CPIO_ALIGN - 1 ) );
 
 	return len;
 }
