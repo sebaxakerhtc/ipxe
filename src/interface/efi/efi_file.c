@@ -55,8 +55,8 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 struct efi_file_reader {
 	/** EFI file */
 	struct efi_file *file;
-	/** Offset within virtual file */
-	size_t offset;
+	/** Position within virtual file */
+	size_t pos;
 	/** Output data buffer */
 	void *data;
 	/** Length of output data buffer */
@@ -140,14 +140,14 @@ static size_t efi_file_len ( struct efi_file *file ) {
 
 	/* Initialise reader */
 	reader.file = file;
-	reader.offset = 0;
+	reader.pos = 0;
 	reader.data = NULL;
 	reader.len = 0;
 
 	/* Perform dummy read to determine file length */
 	file->read ( &reader );
 
-	return reader.offset;
+	return reader.pos;
 }
 
 /**
@@ -164,13 +164,13 @@ static size_t efi_file_read_chunk ( struct efi_file_reader *reader,
 	size_t offset;
 
 	/* Calculate offset into input data */
-	offset = ( file->pos - reader->offset );
+	offset = ( file->pos - reader->pos );
 
 	/* Consume input data range */
-	reader->offset += len;
+	reader->pos += len;
 
 	/* Calculate output length */
-	if ( len < offset ) {
+	if ( offset < len ) {
 		len -= offset;
 	} else {
 		len = 0;
@@ -183,12 +183,6 @@ static size_t efi_file_read_chunk ( struct efi_file_reader *reader,
 		copy_from_user ( reader->data, data, offset, len );
 	} else {
 		memset ( reader->data, 0, len );
-	}
-	if ( len ) {
-		DBGC ( file, "EFIFILE %s read [%#08zx,%#08zx) => "
-		       "[%#08zx,%#08zx)\n", efi_file_name ( file ),
-		       ( reader->offset - len ), reader->offset, file->pos,
-		       ( file->pos + len ) );
 	}
 
 	/* Consume output buffer */
@@ -220,6 +214,7 @@ static size_t efi_file_read_image ( struct efi_file_reader *reader ) {
  * @ret len		Length read
  */
 static size_t efi_file_read_initrd ( struct efi_file_reader *reader ) {
+	struct efi_file *file = reader->file;
 	struct cpio_header cpio;
 	struct image *image;
 	const char *name;
@@ -236,11 +231,13 @@ static size_t efi_file_read_initrd ( struct efi_file_reader *reader ) {
 		if ( image == current_image )
 			continue;
 
-		//
-		DBGC ( reader->file, "*** %s\n", image->name );
-
 		/* Pad to alignment boundary */
-		pad_len = ( ( -reader->offset ) & ( INITRD_ALIGN - 1 ) );
+		pad_len = ( ( -reader->pos ) & ( INITRD_ALIGN - 1 ) );
+		if ( pad_len ) {
+			DBGC ( file, "EFIFILE %s [%#08zx,%#08zx) pad\n",
+			       efi_file_name ( file ), reader->pos,
+			       ( reader->pos + pad_len ) );
+		}
 		len += efi_file_read_chunk ( reader, UNULL, pad_len );
 
 		/* Read CPIO header, if applicable */
@@ -249,6 +246,9 @@ static size_t efi_file_read_initrd ( struct efi_file_reader *reader ) {
 			name = image->name;
 			name_len = strlen ( name );
 			pad_len = ( cpio_len - sizeof ( cpio ) - name_len );
+			DBGC ( file, "EFIFILE %s [%#08zx,%#08zx) %s header\n",
+			       efi_file_name ( file ), reader->pos,
+			       ( reader->pos + cpio_len ), image->name );
 			len += efi_file_read_chunk ( reader,
 						     virt_to_user ( &cpio ),
 						     sizeof ( cpio ) );
@@ -259,6 +259,9 @@ static size_t efi_file_read_initrd ( struct efi_file_reader *reader ) {
 		}
 
 		/* Read file data */
+		DBGC ( file, "EFIFILE %s [%#08zx,%#08zx) %s\n",
+		       efi_file_name ( file ), reader->pos,
+		       ( reader->pos + image->len ), image->name );
 		len += efi_file_read_chunk ( reader, image->data, image->len );
 	}
 
@@ -489,6 +492,7 @@ static EFI_STATUS EFIAPI efi_file_read ( EFI_FILE_PROTOCOL *this,
 					 UINTN *len, VOID *data ) {
 	struct efi_file *file = container_of ( this, struct efi_file, file );
 	struct efi_file_reader reader;
+	size_t pos = file->pos;
 
 	/* If this is the root directory, then construct a directory entry */
 	if ( ! file->read )
@@ -496,12 +500,15 @@ static EFI_STATUS EFIAPI efi_file_read ( EFI_FILE_PROTOCOL *this,
 
 	/* Initialise reader */
 	reader.file = file;
-	reader.offset = 0;
+	reader.pos = 0;
 	reader.data = data;
 	reader.len = *len;
 
 	/* Read from file */
+	DBGC ( file, "EFIFILE %s read [%#08zx,%#08zx)\n",
+	       efi_file_name ( file ), pos, file->pos );
 	*len = file->read ( &reader );
+	assert ( ( pos + *len ) == file->pos );
 
 	return 0;
 }
